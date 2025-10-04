@@ -1,6 +1,16 @@
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+import os, json
+import asyncio
+import tempfile
+from typing import Dict, Any
 
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Body
+import httpx
+from pydantic import BaseModel, Field
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
+
+from realitydefender import RealityDefender
 
 app = FastAPI(
     title="Vercel + FastAPI",
@@ -32,6 +42,172 @@ def get_item(item_id: int):
         },
         "timestamp": "2024-01-01T00:00:00Z"
     }
+
+@app.post("/api/verify-image")
+async def verify_image_with_reality_defender(
+    file: UploadFile = File(..., description="Obraz do weryfikacji (image/*)")
+):
+    """
+    Wysyła obraz do Reality Defender i zwraca surowy wynik (status, score, modele).
+    Bez progu i bez wyliczania is_ai.
+    """
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=415, detail=f"Nieobsługiwany typ pliku: {file.content_type or 'brak'} (wymagane image/*)")
+
+    api_key = os.getenv("REALITY_DEFENDER_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="Brak konfiguracji: ustaw REALITY_DEFENDER_API_KEY")
+
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename or '')[-1], dir="/tmp") as tmp:
+            tmp.write(await file.read())
+            tmp_path = tmp.name
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Nie udało się zapisać pliku: {e}")
+
+    try:
+        rd = RealityDefender(api_key=api_key)
+
+        upload_resp: Dict[str, Any] = await rd.upload(file_path=tmp_path)
+        request_id = upload_resp.get("request_id")
+        if not request_id:
+            raise HTTPException(status_code=502, detail="Reality Defender nie zwrócił request_id")
+
+        # SDK polluje aż do zakończenia
+        result: Dict[str, Any] = await asyncio.wait_for(rd.get_result(request_id), timeout=90.0)
+
+        return {
+            "request_id": request_id,
+            "status": result.get("status"),
+            "score": result.get("score"),
+            "models": [
+                {
+                    "name": m.get("name"),
+                    "status": m.get("status"),
+                    "score": m.get("score"),
+                    "metadata": m.get("metadata"),
+                } for m in result.get("models", [])
+            ],
+            # Opcjonalnie możesz też dodać cały surowy wynik:
+            # "raw": result
+        }
+
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Przekroczono czas oczekiwania na wynik Reality Defender")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Błąd Reality Defender: {e}")
+    finally:
+        try:
+            if 'tmp_path' in locals() and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+@app.post("/api/verify-text")
+async def verify_text_disinfo(text: str = Body(..., embed=True, description="Tekst do analizy")):
+    """
+    Analiza tekstu pod kątem dezinformacji/rosyjskiej propagandy przez xAI Grok.
+    Przyjmuje WYŁĄCZNIE pole 'text' w JSON. Model jest stały: grok-4-fast-reasoning.
+    Zwraca JSON wg zadanego schematu (decision, summary, ai_explanatation, sources).
+    """
+    api_key = os.getenv("XAI_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="Brak konfiguracji: ustaw XAI_API_KEY")
+
+    system_prompt = (
+        "Jesteś dziennikarzem zajmującym się walką z dezinformacją i rosyjską propagandą. "
+        "Przeanalizuj poniższy tekst i oceń, czy jest dezinformacją/rosyjską propagandą czy nie. "
+        "Skup się na informacjach z internetu, przeanalizuj źródła popularnych stron dziennikarskich (np. Onet) "
+        "oraz rządowe strony. Zwróć wynik wyłącznie jako poprawny JSON wg zadanego schematu."
+    )
+
+    response_format = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "disinfo_check",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "decision": {
+                        "type": "string",
+                        "description": "tak/nie czy propaganda/dezinformacja",
+                        "enum": ["tak", "nie"]
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "krótkie podsumowanie, 1-2 zdania"
+                    },
+                    "ai_explanatation": {  # celowo utrzymana literówka wg Twojej specyfikacji
+                        "type": "string",
+                        "description": "około 5 zdań z wyjaśnieniami decyzji"
+                    },
+                    "sources": {
+                        "type": "array",
+                        "description": "max 10 najważniejszych źródeł/URL-i",
+                        "items": {"type": "string"},
+                        "maxItems": 10
+                    }
+                },
+                "required": ["decision", "summary", "ai_explanatation", "sources"],
+                "additionalProperties": False
+            },
+            "strict": True
+        }
+    }
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user",   "content": text}
+    ]
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                "https://api.x.ai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "grok-4-fast-reasoning",   # stały model
+                    "messages": messages,
+                    "response_format": response_format,
+                    "search_parameters": {"mode": "on"},
+                    "temperature": 0.2,
+                },
+            )
+
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=resp.status_code, detail=f"xAI error: {resp.text}")
+
+        data = resp.json()
+        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        if not content:
+            raise HTTPException(status_code=502, detail="Pusta odpowiedź modelu xAI")
+
+        # oczekujemy poprawnego JSON-a
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=502, detail="Model zwrócił niepoprawny JSON")
+
+        # twarde sprawdzenie schematu
+        for key in ["decision", "summary", "ai_explanatation", "sources"]:
+            if key not in parsed:
+                raise HTTPException(status_code=502, detail=f"Brak wymaganego pola: {key}")
+        if parsed.get("decision") not in ("tak", "nie"):
+            raise HTTPException(status_code=502, detail="Pole 'decision' musi być 'tak' lub 'nie'")
+        if not isinstance(parsed.get("sources"), list) or len(parsed["sources"]) > 10:
+            raise HTTPException(status_code=502, detail="Pole 'sources' musi być listą (max 10)")
+
+        return parsed
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Błąd podczas analizy: {e}")
 
 
 @app.get("/", response_class=HTMLResponse)

@@ -1,1 +1,7 @@
 fastapi
+python-multipart
+uvicorn
+realitydefender
+httpx
+pydantic
+supadata
