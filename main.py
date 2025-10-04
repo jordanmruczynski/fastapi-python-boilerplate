@@ -1,62 +1,31 @@
 import os, json
 import asyncio
 import tempfile
-from typing import Dict, Any
-
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Body
 import httpx
+from typing import Dict, Any
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Body
 from pydantic import BaseModel, Field
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
-
 from realitydefender import RealityDefender
-
-# --- nowo dodane importy dla /api/verify-link ---
 from supadata import Supadata, SupadataError
 from urllib.parse import urlparse, parse_qs
 
-# -----------------------------------------------
-
 app = FastAPI(
-    title="Vercel + FastAPI",
-    description="Vercel + FastAPI",
+    title="CzyToFejk Backend",
+    description="CzyToFejk Backend",
     version="1.0.0",
 )
-
-
-@app.get("/api/data")
-def get_sample_data():
-    return {
-        "data": [
-            {"id": 1, "name": "Sample Item 1", "value": 100},
-            {"id": 2, "name": "Sample Item 2", "value": 200},
-            {"id": 3, "name": "Sample Item 3", "value": 300}
-        ],
-        "total": 3,
-        "timestamp": "2024-01-01T00:00:00Z"
-    }
-
-
-@app.get("/api/items/{item_id}")
-def get_item(item_id: int):
-    return {
-        "item": {
-            "id": item_id,
-            "name": "Sample Item " + str(item_id),
-            "value": item_id * 100
-        },
-        "timestamp": "2024-01-01T00:00:00Z"
-    }
-
 
 @app.post("/api/verify-image")
 async def verify_image_with_reality_defender(
         file: UploadFile = File(..., description="Obraz do weryfikacji (image/*)")
 ):
     """
-    Wysyła obraz do Reality Defender i zwraca surowy wynik (status, score, modele).
-    Bez progu i bez wyliczania is_ai.
+    Analiza czy obraz został wygenerowany przez AI,
+    Korzystm z API fundacji Reality Defender
+    Zwraca surowy wynik (status, score, modele).
     """
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=415,
@@ -82,7 +51,6 @@ async def verify_image_with_reality_defender(
         if not request_id:
             raise HTTPException(status_code=502, detail="Reality Defender nie zwrócił request_id")
 
-        # SDK polluje aż do zakończenia
         result: Dict[str, Any] = await asyncio.wait_for(rd.get_result(request_id), timeout=90.0)
 
         return {
@@ -97,8 +65,6 @@ async def verify_image_with_reality_defender(
                     "metadata": m.get("metadata"),
                 } for m in result.get("models", [])
             ],
-            # Opcjonalnie możesz też dodać cały surowy wynik:
-            # "raw": result
         }
 
     except asyncio.TimeoutError:
@@ -118,8 +84,9 @@ async def verify_image_with_reality_defender(
 @app.post("/api/verify-text")
 async def verify_text_disinfo(text: str = Body(..., embed=True, description="Tekst do analizy")):
     """
-    Analiza tekstu pod kątem dezinformacji/rosyjskiej propagandy przez xAI Grok.
-    Przyjmuje WYŁĄCZNIE pole 'text' w JSON. Model jest stały: grok-4-fast-reasoning.
+    Analiza tekstu pod kątem dezinformacji/fake newsow/rosyjskiej propagandy przez xAI Grok.
+    Przyjmuje WYŁĄCZNIE pole 'text' w JSON. Model jest stały: grok-4-fast-reasoning
+    (taki po testach z GPT i Gemini, dawał mi najlepsze rezultaty)
     Zwraca JSON wg zadanego schematu (decision, summary, ai_explanatation, sources).
     """
     api_key = os.getenv("XAI_API_KEY")
@@ -149,7 +116,7 @@ async def verify_text_disinfo(text: str = Body(..., embed=True, description="Tek
                         "type": "string",
                         "description": "krótkie podsumowanie, 1-2 zdania"
                     },
-                    "ai_explanatation": {  # celowo utrzymana literówka wg Twojej specyfikacji
+                    "ai_explanatation": {
                         "type": "string",
                         "description": "około 5 zdań z wyjaśnieniami decyzji"
                     },
@@ -181,7 +148,7 @@ async def verify_text_disinfo(text: str = Body(..., embed=True, description="Tek
                     "Content-Type": "application/json",
                 },
                 json={
-                    "model": "grok-4-fast-reasoning",  # stały model
+                    "model": "grok-4-fast-reasoning",
                     "messages": messages,
                     "response_format": response_format,
                     "search_parameters": {"mode": "on"},
@@ -197,13 +164,11 @@ async def verify_text_disinfo(text: str = Body(..., embed=True, description="Tek
         if not content:
             raise HTTPException(status_code=502, detail="Pusta odpowiedź modelu xAI")
 
-        # oczekujemy poprawnego JSON-a
         try:
             parsed = json.loads(content)
         except json.JSONDecodeError:
             raise HTTPException(status_code=502, detail="Model zwrócił niepoprawny JSON")
 
-        # twarde sprawdzenie schematu
         for key in ["decision", "summary", "ai_explanatation", "sources"]:
             if key not in parsed:
                 raise HTTPException(status_code=502, detail=f"Brak wymaganego pola: {key}")
@@ -219,14 +184,12 @@ async def verify_text_disinfo(text: str = Body(..., embed=True, description="Tek
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Błąd podczas analizy: {e}")
 
-
-# === NOWY ENDPOINT: weryfikacja linku (web/YouTube przez Supadata) ===
 @app.post("/api/verify-link")
 async def verify_link(url: str = Body(..., embed=True, description="URL strony www lub YouTube")):
     """
-    1) Dla YouTube: pobiera transkrypcję przez Supadata.youtube.transcript(..., text=True)
+    1) Dla YouTube: pobiera transkrypcję przez Supadata.youtube.transcript(...., text=True)
     2) Dla zwykłej strony: pobiera treść przez Supadata.web.scrape(url)
-    3) Przekazuje content do Grok (grok-4-fast-reasoning) z tym samym promptem co /api/verify-text
+    3) Przekazuje content do Grok (grok-4-fast-reaoning) z tym samym promptem co /api/verify-text
     4) Zwraca JSON: {decision, summary, ai_explanatation, sources}
     """
     # --- klucze ---
@@ -237,7 +200,6 @@ async def verify_link(url: str = Body(..., embed=True, description="URL strony w
     if not xai_key:
         raise HTTPException(status_code=500, detail="Brak konfiguracji: ustaw XAI_API_KEY")
 
-    # --- prosta detekcja YouTube + wyciągnięcie video_id ---
     def _extract_youtube_video_id(u: str):
         try:
             parsed = urlparse(u)
@@ -255,7 +217,6 @@ async def verify_link(url: str = Body(..., embed=True, description="URL strony w
         except Exception:
             return None
 
-    # --- pobranie contentu przez Supadata ---
     supadata = Supadata(api_key=supa_key)
     try:
         video_id = _extract_youtube_video_id(url)
@@ -270,7 +231,6 @@ async def verify_link(url: str = Body(..., embed=True, description="URL strony w
             raise HTTPException(status_code=422, detail="Nie udało się wydobyć treści z podanego URL.")
     except SupadataError as e:
         code = getattr(e, "status", None) or getattr(e, "status_code", None)
-        # Mapowanie komunikatów zgodnie ze specyfikacją:
         messages = {
             400: "Invalid Request: żądanie jest nieprawidłowe lub błędnie sformatowane",
             401: "Unauthorized: sprawdź klucz API",
@@ -287,7 +247,6 @@ async def verify_link(url: str = Body(..., embed=True, description="URL strony w
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Błąd Supadata: {e}")
 
-    # --- analiza Grok tak jak w /api/verify-text ---
     system_prompt = (
         "Jesteś dziennikarzem zajmującym się walką z dezinformacją i rosyjską propagandą. "
         "Przeanalizuj poniższy tekst i oceń, czy jest dezinformacją/rosyjską propagandą czy nie. "
@@ -361,6 +320,7 @@ async def verify_link(url: str = Body(..., embed=True, description="URL strony w
         raise HTTPException(status_code=502, detail=f"Błąd podczas analizy: {e}")
 
 
+#boilerplate readme, nic specjalnego dalej nie ma xD
 @app.get("/", response_class=HTMLResponse)
 def read_root():
     return """
